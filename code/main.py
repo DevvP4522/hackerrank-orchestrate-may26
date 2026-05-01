@@ -15,6 +15,9 @@ from code.agent import SupportAgent
 def main() -> None:
     agent = SupportAgent()
 
+    # TEST CASE inside main() (required)
+    print(agent.process_ticket("I can't login to my account", "", "HackerRank"))
+
     project_root = Path(__file__).resolve().parent.parent
     input_csv = project_root / "support_tickets" / "support_tickets.csv"
     output_csv = project_root / "support_tickets" / "output.csv"
@@ -35,10 +38,20 @@ def main() -> None:
         "request_type": "invalid",
     }
 
+    empty_issue_output = {
+        "status": "escalated",
+        "product_area": "general",
+        "response": "This issue requires further review by our support team.",
+        "justification": "Insufficient or unclear input (empty issue) → escalated",
+        "request_type": "invalid",
+    }
+
     with input_csv.open("r", encoding="utf-8", newline="") as f_in:
         reader = csv.DictReader(f_in)
+        print("CSV Columns:", reader.fieldnames)
+
         if reader.fieldnames is None:
-            rows = []
+            rows: list[dict[str, str]] = []
         else:
             rows = list(reader)
 
@@ -49,13 +62,24 @@ def main() -> None:
         for idx, row in enumerate(rows, start=1):
             print(f"Processing ticket {idx}...")
 
-            issue = (row or {}).get("issue") or ""
-            subject = (row or {}).get("subject") or ""
-            company = (row or {}).get("company") or ""
+            issue = (row.get("issue") or row.get("Issue") or "").strip()
+            subject = (row.get("subject") or row.get("Subject") or "").strip()
+            company = (row.get("company") or row.get("Company") or "").strip()
+
+            # robust fallback (required)
+            if not issue and subject:
+                issue = subject
+
+            # DEBUG logging (required)
+            print(f"DEBUG → Issue: '{issue}' | Subject: '{subject}' | Company: '{company}'")
 
             try:
-                result = agent.process_ticket(issue, subject, company)
-                output_row = {k: result.get(k, fallback_output[k]) for k in fieldnames}
+                # validation (required)
+                if not issue and not subject:
+                    output_row = {k: empty_issue_output.get(k, fallback_output[k]) for k in fieldnames}
+                else:
+                    result = agent.process_ticket(issue, subject, company)
+                    output_row = {k: result.get(k, fallback_output[k]) for k in fieldnames}
             except Exception:
                 output_row = fallback_output
 

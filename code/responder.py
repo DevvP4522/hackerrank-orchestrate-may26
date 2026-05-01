@@ -4,13 +4,21 @@ import re
 from typing import Dict, List, Sequence, Tuple
 
 FALLBACK_MESSAGE = (
-    "I'm sorry, but I don't have enough information to answer this request safely. "
+    "I'm unable to confidently answer this based on available information. "
     "Please contact support for further assistance."
 )
+
+CLOSING_LINE = "If the issue persists, please contact support."
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
 def _normalize_text(text: str) -> str:
     return (text or "").strip().lower()
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"\S+", text or ""))
 
 
 def _tokenize_issue(issue: str) -> List[str]:
@@ -18,9 +26,7 @@ def _tokenize_issue(issue: str) -> List[str]:
     Extract stable keyword tokens from the issue to drive extractive selection.
     """
     normalized = _normalize_text(issue)
-    # Keep alphanumerics/underscore, drop very short tokens.
     tokens = re.findall(r"\b[a-z0-9_]{2,}\b", normalized)
-    # Deduplicate while preserving order.
     seen = set()
     out: List[str] = []
     for t in tokens:
@@ -29,18 +35,6 @@ def _tokenize_issue(issue: str) -> List[str]:
         seen.add(t)
         out.append(t)
     return out
-
-
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
-
-
-def _split_sentences(text: str) -> List[str]:
-    cleaned = (text or "").strip()
-    if not cleaned:
-        return []
-    parts = _SENTENCE_SPLIT_RE.split(cleaned)
-    # Also handle texts without punctuation by keeping as single "sentence".
-    return [p.strip() for p in parts if p and p.strip()]
 
 
 _ACTION_KEYWORDS = (
@@ -57,6 +51,7 @@ _ACTION_KEYWORDS = (
     "log in",
     "login",
     "sign in",
+    "sign-in",
     "reset",
     "password",
     "forgot",
@@ -66,7 +61,18 @@ _ACTION_KEYWORDS = (
     "enable",
     "disable",
     "verify",
+    "confirm",
+    "change",
 )
+
+
+def _sentence_action_score(sentence: str) -> int:
+    s = _normalize_text(sentence)
+    score = 0
+    for kw in _ACTION_KEYWORDS:
+        if kw in s:
+            score += 1
+    return score
 
 
 def _sentence_keyword_overlap(sentence: str, tokens: Sequence[str]) -> int:
@@ -80,197 +86,139 @@ def _sentence_keyword_overlap(sentence: str, tokens: Sequence[str]) -> int:
     return overlap
 
 
-def _sentence_action_score(sentence: str) -> int:
-    s = _normalize_text(sentence)
-    score = 0
-    for kw in _ACTION_KEYWORDS:
-        if kw in s:
-            score += 1
-    return score
+def _split_sentences(text: str) -> List[str]:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return []
+    parts = _SENTENCE_SPLIT_RE.split(cleaned)
+    return [p.strip() for p in parts if p and p.strip()]
 
 
-def _dedupe_sentences(sentences: List[str]) -> List[str]:
-    """
-    Dedupe by normalized form to avoid repeated lines across docs.
-    """
+def _clean_sentence(sentence: str) -> str:
+    s = (sentence or "").strip()
+    # Ensure proper punctuation (deterministic and safe).
+    if s and s[-1] not in ".!?":
+        s += "."
+    return s
+
+
+def _dedupe_sentences_by_norm(sentences: Sequence[str]) -> List[str]:
     seen = set()
     out: List[str] = []
     for s in sentences:
         ns = _normalize_text(s)
-        if ns in seen:
+        if not ns or ns in seen:
             continue
         seen.add(ns)
         out.append(s)
     return out
 
 
-def _is_relevant_sentence(sentence: str, issue_tokens: Sequence[str]) -> bool:
-    s = _normalize_text(sentence)
-    if not s:
-        return False
-    if _sentence_keyword_overlap(sentence, issue_tokens) > 0:
-        return True
-    # If no keyword overlap, still allow strongly instructional/action sentences.
-    return _sentence_action_score(sentence) > 0
-
-
-def _safe_truncate_words(text: str, max_words: int) -> str:
-    words = re.findall(r"\S+", (text or "").strip())
-    if len(words) <= max_words:
-        return (text or "").strip()
-    return " ".join(words[:max_words]).strip()
-
-
-def _extract_support_steps(issue: str, retrieved_docs: List[Dict]) -> Tuple[List[str], List[str]]:
+def _extract_candidate_sentences(issue: str, top_docs: List[Dict]) -> List[Tuple[float, str]]:
     """
-    Returns (steps_sentences, next_step_sentences).
-    Both are drawn extractively from retrieved_docs.
+    Deterministically returns sentence candidates as (sentence_score, sentence),
+    prioritizing higher scoring docs and instructional/action sentences.
     """
     issue_tokens = _tokenize_issue(issue)
-
     candidates: List[Tuple[float, str]] = []
-    next_candidates: List[Tuple[float, str]] = []
 
-    for doc in retrieved_docs:
-        doc_text = ""
-        doc_score = 0.0
-
-        if isinstance(doc, dict):
-            doc_text = doc.get("text", "") or ""
-            try:
-                doc_score = float(doc.get("score", 0.0))
-            except Exception:
-                doc_score = 0.0
-
-        sentences = _split_sentences(doc_text)
-        if not sentences:
+    for doc in top_docs:
+        if not isinstance(doc, dict):
             continue
 
-        for sentence in sentences:
+        doc_text = doc.get("text", "")
+        if not isinstance(doc_text, str) or not doc_text.strip():
+            continue
+
+        try:
+            doc_score = float(doc.get("score", 0.0))
+        except Exception:
+            doc_score = 0.0
+
+        for sentence in _split_sentences(doc_text):
             s = sentence.strip()
             if not s:
                 continue
 
+            # Keep relevance filtering, but don't be overly strict:
+            # accept sentence if it has action cues OR any issue keyword overlap.
             overlap = _sentence_keyword_overlap(s, issue_tokens)
             action = _sentence_action_score(s)
+            if overlap <= 0 and action <= 0:
+                continue
 
-            # Prefer sentences that are instructional; also weight by doc relevance.
-            # Keep it deterministic: no randomness.
-            sentence_score = (overlap * 2.0) + action + (doc_score * 0.10)
+            # Prefer action + keyword overlap, and slightly weight doc relevance.
+            sentence_score = (overlap * 2.0) + action + (doc_score * 0.15)
+            candidates.append((sentence_score, _clean_sentence(s)))
 
-            if _is_relevant_sentence(s, issue_tokens):
-                candidates.append((sentence_score, s))
-
-            # Next step: look for explicit contact/support style guidance.
-            ns = _normalize_text(s)
-            if any(x in ns for x in ("contact support", "contact", "support for", "reach out")):
-                next_candidates.append((sentence_score, s))
-
-    # Sort highest score first.
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    next_candidates.sort(key=lambda x: x[0], reverse=True)
-
-    steps = [s for _, s in candidates]
-    steps = _dedupe_sentences(steps)
-
-    # Keep steps concise.
-    steps = steps[:5]
-
-    next_step = [s for _, s in next_candidates]
-    next_step = _dedupe_sentences(next_step)
-    next_step = next_step[:2]
-
-    return steps, next_step
+    # Determinism: tie-break by sentence text
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    return candidates
 
 
 def generate_response(issue: str, retrieved_docs: list) -> str:
     """
-    Generate a safe, grounded, deterministic response using ONLY retrieved_docs content.
+    Generate a grounded, deterministic structured response using ONLY retrieved_docs content.
 
-    retrieved_docs items are expected:
-    {
-      "text": "...",
-      "source": "...",
-      "product_area": "...",
-      "score": float
-    }
+    If candidate sentences exist:
+      - select top 2–3 sentences based on score
+      - DO NOT reject them unless completely irrelevant
+
+    Fallback ONLY when:
+      - no documents retrieved
+      - no candidate sentences extracted
     """
-    if not retrieved_docs:
+    if not retrieved_docs or not isinstance(retrieved_docs, list):
         return FALLBACK_MESSAGE
 
-    # Validate retrieved docs shape minimally.
     valid_docs: List[Dict] = []
     for d in retrieved_docs:
-        if (
-            isinstance(d, dict)
-            and isinstance(d.get("text", ""), str)
-            and d.get("text", "").strip()
-        ):
-            valid_docs.append(d)
+        if not isinstance(d, dict):
+            continue
+        text = d.get("text", "")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        valid_docs.append(d)
 
     if not valid_docs:
         return FALLBACK_MESSAGE
 
-    # Select top documents by score.
-    def _doc_score(d: Dict) -> float:
-        try:
-            return float(d.get("score", 0.0))
-        except Exception:
-            return 0.0
+    issue_text = (issue or "").strip()
+    # Do not over-filter based on issue length; only require that docs/candidates exist.
 
-    valid_docs.sort(key=_doc_score, reverse=True)
+    def _doc_sort_key(d: Dict) -> Tuple[float, str]:
+        try:
+            score = float(d.get("score", 0.0))
+        except Exception:
+            score = 0.0
+        text = d.get("text", "")
+        text_str = text if isinstance(text, str) else ""
+        return (score, text_str)
+
+    valid_docs.sort(key=lambda d: (_doc_sort_key(d)[0], _doc_sort_key(d)[1]), reverse=True)
     top_docs = valid_docs[:3]
 
-    steps, next_steps = _extract_support_steps(issue=issue or "", retrieved_docs=top_docs)
-
-    # Safety checks: ensure response is not empty or too generic.
-    if not steps:
+    candidates = _extract_candidate_sentences(issue=issue_text, top_docs=top_docs)
+    if not candidates:
         return FALLBACK_MESSAGE
 
-    # Construct response; keep it within ~150-250 words.
-    response_lines: List[str] = []
-    response_lines.append("I understand you’re trying to resolve this issue.")
-    response_lines.append("")
-    response_lines.append("To resolve your issue, please try the following steps:")
-
-    for idx, step in enumerate(steps, start=1):
-        response_lines.append(f"{idx}. {_safe_truncate_words(step, 35)}")
-
-    if next_steps:
-        response_lines.append("")
-        response_lines.append(_safe_truncate_words(next_steps[0], 40))
-
-    response = "\n".join(response_lines).strip()
-
-    # Final safety check: heuristic guard against being too generic.
-    normalized = _normalize_text(response)
-    if not any(
-        kw in normalized
-        for kw in (
-            "go to",
-            "click",
-            "select",
-            "check",
-            "ensure",
-            "follow",
-            "enter",
-            "submit",
-            "reset",
-            "forgot",
-            "password",
-        )
-    ):
+    top_sentences = [s for _, s in candidates[:3]]
+    top_sentences = _dedupe_sentences_by_norm(top_sentences)
+    if not top_sentences:
         return FALLBACK_MESSAGE
 
-    # Word limit (soft).
-    words = re.findall(r"\S+", response)
-    if len(words) > 260:
-        trimmed_lines: List[str] = []
-        trimmed_lines.append("I understand you’re trying to resolve this issue.")
-        trimmed_lines.append("")
-        trimmed_lines.append("To resolve your issue, please try the following steps:")
-        for idx, step in enumerate(steps[:3], start=1):
-            trimmed_lines.append(f"{idx}. {_safe_truncate_words(step, 35)}")
-        response = "\n".join(trimmed_lines).strip()
+    # Use top 2–3 sentences; prefer 3 if available.
+    use_n = 3 if len(top_sentences) >= 3 else len(top_sentences)
+    selected = top_sentences[:use_n]
 
-    return response
+    lines: List[str] = []
+    lines.append("To resolve your issue, please try the following steps:")
+    lines.append("")
+
+    for idx, s in enumerate(selected, start=1):
+        lines.append(f"{idx}. {s}")
+
+    lines.append("")
+    lines.append(CLOSING_LINE)
+
+    return "\n".join(lines).strip()

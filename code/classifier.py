@@ -1,35 +1,44 @@
 from __future__ import annotations
 
-import re
 from typing import Tuple
 
+_REQUEST_TYPES: Tuple[str, ...] = ("product_issue", "feature_request", "bug", "invalid")
+_PRODUCT_AREAS: Tuple[str, ...] = (
+    "account",
+    "billing",
+    "fraud",
+    "api",
+    "assessment",
+    "login",
+    "payment",
+    "security",
+    "general",
+)
 
-_REQUEST_TYPES = ("product_issue", "feature_request", "bug", "invalid")
-_PRODUCT_AREAS = ("account", "billing", "fraud", "api", "assessment", "login", "payment", "security", "general")
-
-
-_REQUEST_TYPE_KEYWORDS_PRODUCT_ISSUE = (
-    "error",
+# Keyword-based request type classification (deterministic substring matching).
+_BUG_KEYWORDS: Tuple[str, ...] = (
     "not working",
+    "error",
     "failed",
+    "down",
+)
+
+_PRODUCT_ISSUE_KEYWORDS: Tuple[str, ...] = (
+    "can't",
+    "cannot",
+    "unable",
     "issue",
+    "problem",
 )
 
-_REQUEST_TYPE_KEYWORDS_BUG = (
-    "bug",
-    "crash",
-    "unexpected",
-)
-
-_REQUEST_TYPE_KEYWORDS_FEATURE = (
-    "feature",
+_FEATURE_REQUEST_KEYWORDS: Tuple[str, ...] = (
     "add",
     "request",
-    "suggest",
+    "can you",
+    "please allow",
 )
 
-_INVALID_MIN_WORDS = 3
-
+_INVALID_WORD_COUNT_MIN = 3
 
 _PRODUCT_AREA_KEYWORDS = {
     "account": ("login", "password", "signin"),
@@ -44,75 +53,40 @@ def _normalize_text(text: str) -> str:
     return (text or "").strip().lower()
 
 
-def _word_count(text: str) -> int:
-    # Keep it simple/deterministic: split on word boundaries.
-    words = re.findall(r"\b\w+\b", text.lower())
-    return len(words)
+def _word_count(issue: str) -> int:
+    # Requirement: word_count = len(issue.strip().split())
+    return len((issue or "").strip().split())
 
 
 def _contains_any(haystack: str, needles: Tuple[str, ...]) -> bool:
     return any(n in haystack for n in needles)
 
 
-def _fallback_by_overlap(text: str) -> str:
+def _classify_request_type(combined_text: str) -> str:
     """
-    Lightweight NLP fallback: choose class by keyword overlap.
-    Deterministic and uses only local heuristics.
+    Keyword-based triage.
+    Assumes the caller already applied the invalid rules based on emptiness/word_count.
     """
-    # Token overlap for robustness (still keyword-driven).
-    tokens = set(re.findall(r"\b\w+\b", text))
-    # Also include bigrams/trigrams already handled in substring matching elsewhere; here just token overlap.
-    def score_for(keywords: Tuple[str, ...]) -> int:
-        score = 0
-        for kw in keywords:
-            # If keyword is multi-word, fall back to substring check since overlap won't catch it well.
-            if " " in kw:
-                score += 1 if kw in text else 0
-                continue
-            score += 1 if kw in tokens else 0
-        return score
+    text = _normalize_text(combined_text)
 
-    product_issue_score = score_for(_REQUEST_TYPE_KEYWORDS_PRODUCT_ISSUE)
-    bug_score = score_for(_REQUEST_TYPE_KEYWORDS_BUG)
-    feature_score = score_for(_REQUEST_TYPE_KEYWORDS_FEATURE)
-
-    best = max(
-        [
-            ("product_issue", product_issue_score),
-            ("bug", bug_score),
-            ("feature_request", feature_score),
-        ],
-        key=lambda x: x[1],
-    )
-    if best[1] <= 0:
-        return "invalid"
-    return best[0]
-
-
-def _classify_request_type(text: str) -> str:
-    # Primary rule-based classification.
-    # If multiple matches occur, we use fixed precedence for determinism: bug > product_issue > feature_request > invalid.
-    if _contains_any(text, _REQUEST_TYPE_KEYWORDS_BUG):
+    # Precedence: bug > product_issue > feature_request
+    # (Deterministic and reduces invalid classification rate.)
+    if _contains_any(text, _BUG_KEYWORDS):
         return "bug"
-    if _contains_any(text, _REQUEST_TYPE_KEYWORDS_PRODUCT_ISSUE):
+    if _contains_any(text, _PRODUCT_ISSUE_KEYWORDS):
         return "product_issue"
-    if _contains_any(text, _REQUEST_TYPE_KEYWORDS_FEATURE):
+    if _contains_any(text, _FEATURE_REQUEST_KEYWORDS):
         return "feature_request"
 
-    # invalid: empty, nonsense, or unrelated
-    if _word_count(text) < _INVALID_MIN_WORDS:
-        return "invalid"
-
-    # Lightweight NLP fallback: keyword overlap scoring.
-    return _fallback_by_overlap(text)
+    # If the input is meaningful but no keyword matched, default to product_issue.
+    # This prevents over-aggressive invalid classification.
+    return "product_issue"
 
 
 def _classify_product_area(text: str) -> str:
-    # Primary rule-based classification per requirement.
+    normalized = _normalize_text(text)
     for area, keywords in _PRODUCT_AREA_KEYWORDS.items():
-        if _contains_any(text, keywords):
-            # Note: "login" and "payment" and "security" exist in the category list but are not part of the provided
-            # rules. We strictly follow the given ruleset and thus do not map those areas unless keywords match.
+        if _contains_any(normalized, keywords):
             return area
     return "general"
 
@@ -121,11 +95,22 @@ def classify_ticket(issue: str, subject: str) -> Tuple[str, str]:
     """
     Returns: (request_type, product_area)
     """
+    issue_norm = _normalize_text(issue)
     combined = f"{subject or ''} {issue or ''}"
-    text = _normalize_text(combined)
+    combined_norm = _normalize_text(combined)
 
-    request_type = _classify_request_type(text)
-    product_area = _classify_product_area(text)
+    # Invalid should only be used when:
+    # - issue is empty
+    # - issue is <3 words (short/unclear meaningfulness)
+    wc = _word_count(issue)
+    if not issue_norm:
+        request_type = "invalid"
+    elif wc < _INVALID_WORD_COUNT_MIN:
+        request_type = "invalid"
+    else:
+        request_type = _classify_request_type(combined_norm)
+
+    product_area = _classify_product_area(combined_norm)
 
     if request_type not in _REQUEST_TYPES:
         request_type = "invalid"
